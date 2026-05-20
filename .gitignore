@@ -13,3 +13,4 @@ build/
 test-output/
 /outputs
 /papers
+/.omx/state
