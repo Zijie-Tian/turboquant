@@ -10,6 +10,14 @@ import os, sys, subprocess, json, time
 
 PYTHON = sys.executable
 GPUS = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,4,6")
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _with_repo_on_pythonpath(env):
+    """Let /tmp subprocess scripts import this checkout without editable install."""
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = REPO_ROOT if not existing else f"{REPO_ROOT}{os.pathsep}{existing}"
+    return env
 
 MODELS = {
     "Qwen2.5-7B-Instruct": {
@@ -36,6 +44,7 @@ def run_script(name, code):
     env["CUDA_VISIBLE_DEVICES"] = GPUS
     env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     env["TOKENIZERS_PARALLELISM"] = "false"
+    _with_repo_on_pythonpath(env)
     r = subprocess.run([PYTHON, path], capture_output=True, text=True, env=env, timeout=600)
     if r.returncode != 0:
         print(f"  {name} FAILED")

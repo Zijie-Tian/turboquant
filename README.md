@@ -183,6 +183,24 @@ baseline_vs_tq_v2.py   # Block-level measurement during inference
 ```bash
 pip install -e .
 
+# Run a configurable single-prompt evaluation
+python eval.py \
+  --model /mnt/data/tzj/models/Llama-3.1-8B-Instruct \
+  --mode tq \
+  --prompt "Explain KV cache quantization in one sentence." \
+  --max-tokens 64
+
+# Save a text-only answer
+python eval.py \
+  --model /mnt/data/tzj/models/Llama-3.1-8B-Instruct \
+  --mode baseline \
+  --input-file prompt.txt \
+  --output-format text \
+  --output-file answer.txt
+
+# Run lightweight unit tests
+python -m pytest -q
+
 # Run paper validation (CPU, no GPU needed)
 python validate_paper.py
 

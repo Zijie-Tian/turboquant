@@ -8,6 +8,7 @@ Kept for backward compatibility with scripts that import from here.
 from __future__ import annotations
 
 import logging
+import os
 import torch
 
 import turboquant.integration.vllm as _new_backend

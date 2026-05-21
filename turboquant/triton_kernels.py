@@ -196,6 +196,126 @@ def _turboquant_qjl_score_kernel(
              existing + qjl_scores, mask=n_mask)
 
 
+# ─── GQA score kernels ─────────────────────────────────────────────────
+#
+# Llama-style GQA has more query heads than KV heads. The plain score kernels
+# assume one quantized-key row per query head. These variants map each query
+# head to its owning KV head via ``kv_h = query_h // gqa_ratio`` and avoid
+# materializing repeated compressed keys.
+
+@triton.jit
+def _turboquant_mse_score_gqa_kernel(
+    # Pointers
+    Q_ptr,          # (QH, D) query vectors (already rotated: q @ Pi^T)
+    MSE_ptr,        # (KVH, N, packed_d) bit-packed indices
+    NORMS_ptr,      # (KVH, N) original norms
+    CENTROIDS_ptr,  # (n_clusters,) centroid values
+    OUT_ptr,        # (QH, N) output scores
+    # Strides
+    stride_q_h, stride_q_d,
+    stride_m_h, stride_m_n, stride_m_d,
+    stride_n_h, stride_n_n,
+    stride_o_h, stride_o_n,
+    # Dimensions
+    N,
+    D: tl.constexpr,
+    PACKED_D: tl.constexpr,
+    GQA_RATIO: tl.constexpr,
+    # Quantization params
+    BITS: tl.constexpr,
+    VALS_PER_BYTE: tl.constexpr,
+    # Block sizes
+    BLOCK_N: tl.constexpr,
+):
+    """Compute MSE scores for GQA without repeating KV tensors."""
+    pid_qh = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_kvh = pid_qh // GQA_RATIO
+
+    n_start = pid_n * BLOCK_N
+    n_offs = n_start + tl.arange(0, BLOCK_N)
+    n_mask = n_offs < N
+
+    scores = tl.zeros([BLOCK_N], dtype=tl.float32)
+    BIT_MASK: tl.constexpr = (1 << BITS) - 1
+
+    for byte_idx in range(PACKED_D):
+        packed = tl.load(
+            MSE_ptr + pid_kvh * stride_m_h + n_offs * stride_m_n + byte_idx * stride_m_d,
+            mask=n_mask, other=0
+        ).to(tl.int32)
+
+        for sub in range(VALS_PER_BYTE):
+            coord_idx = byte_idx * VALS_PER_BYTE + sub
+            if coord_idx < D:
+                idx = (packed >> (sub * BITS)) & BIT_MASK
+                centroid_val = tl.load(CENTROIDS_ptr + idx)
+                q_val = tl.load(Q_ptr + pid_qh * stride_q_h + coord_idx * stride_q_d).to(tl.float32)
+                scores += q_val * centroid_val
+
+    norms = tl.load(NORMS_ptr + pid_kvh * stride_n_h + n_offs * stride_n_n,
+                    mask=n_mask, other=0.0).to(tl.float32)
+    scores = scores * norms
+
+    tl.store(OUT_ptr + pid_qh * stride_o_h + n_offs * stride_o_n,
+             scores, mask=n_mask)
+
+
+@triton.jit
+def _turboquant_qjl_score_gqa_kernel(
+    Q_SKETCH_ptr,    # (QH, D) pre-sketched query
+    SIGNS_ptr,       # (KVH, N, packed_d) packed sign bits
+    RES_NORMS_ptr,   # (KVH, N) residual norms
+    OUT_ptr,         # (QH, N) output QJL scores (added to existing)
+    # Strides
+    stride_qs_h, stride_qs_d,
+    stride_s_h, stride_s_n, stride_s_d,
+    stride_rn_h, stride_rn_n,
+    stride_o_h, stride_o_n,
+    # Dims
+    N,
+    D: tl.constexpr,
+    PACKED_D_SIGNS: tl.constexpr,
+    GQA_RATIO: tl.constexpr,
+    QJL_SCALE,
+    # Block sizes
+    BLOCK_N: tl.constexpr,
+):
+    """Compute QJL score contribution for GQA without repeating KV tensors."""
+    pid_qh = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_kvh = pid_qh // GQA_RATIO
+
+    n_start = pid_n * BLOCK_N
+    n_offs = n_start + tl.arange(0, BLOCK_N)
+    n_mask = n_offs < N
+
+    dot = tl.zeros([BLOCK_N], dtype=tl.float32)
+
+    for byte_idx in range(PACKED_D_SIGNS):
+        packed = tl.load(
+            SIGNS_ptr + pid_kvh * stride_s_h + n_offs * stride_s_n + byte_idx * stride_s_d,
+            mask=n_mask, other=0
+        ).to(tl.int32)
+
+        for bit in range(8):
+            coord_idx = byte_idx * 8 + bit
+            if coord_idx < D:
+                sign_bit = (packed >> bit) & 1
+                sign_val = tl.where(sign_bit == 1, 1.0, -1.0)
+                q_val = tl.load(Q_SKETCH_ptr + pid_qh * stride_qs_h + coord_idx * stride_qs_d).to(tl.float32)
+                dot += q_val * sign_val
+
+    res_norms = tl.load(RES_NORMS_ptr + pid_kvh * stride_rn_h + n_offs * stride_rn_n,
+                        mask=n_mask, other=0.0).to(tl.float32)
+    qjl_scores = dot * res_norms * QJL_SCALE
+
+    existing = tl.load(OUT_ptr + pid_qh * stride_o_h + n_offs * stride_o_n,
+                       mask=n_mask, other=0.0)
+    tl.store(OUT_ptr + pid_qh * stride_o_h + n_offs * stride_o_n,
+             existing + qjl_scores, mask=n_mask)
+
+
 # ─── Kernel 3: Fused decode attention (online softmax over TQ keys + values) ──
 #
 # For decode, query has n_q=1. We iterate over KV tokens in blocks,
@@ -500,6 +620,127 @@ def turboquant_attention_score(
     scores = turboquant_qjl_score(q_sketch, qjl_signs, res_norms, qjl_scale, out=scores)
 
     return scores
+
+
+def turboquant_mse_score_gqa(
+    query_rot: torch.Tensor,     # (QH, D)
+    mse_packed: torch.Tensor,    # (KVH, N, packed_d) uint8
+    norms: torch.Tensor,         # (KVH, N) float
+    centroids: torch.Tensor,     # (n_clusters,) float32
+    mse_bits: int,
+    gqa_ratio: int,
+) -> torch.Tensor:
+    """Compute MSE attention scores for GQA without repeating KV tensors."""
+    if query_rot.dim() == 3:
+        query_rot = query_rot.squeeze(1)
+
+    QH, D = query_rot.shape
+    N = mse_packed.shape[1]
+    packed_d = mse_packed.shape[2]
+    eff_bits, vals_per_byte = _get_packing_params(mse_bits)
+
+    out = torch.zeros(QH, N, device=query_rot.device, dtype=torch.float32)
+    BLOCK_N = min(128, triton.next_power_of_2(N))
+    grid = (QH, triton.cdiv(N, BLOCK_N))
+
+    _turboquant_mse_score_gqa_kernel[grid](
+        query_rot, mse_packed, norms, centroids, out,
+        query_rot.stride(0), query_rot.stride(1),
+        mse_packed.stride(0), mse_packed.stride(1), mse_packed.stride(2),
+        norms.stride(0), norms.stride(1),
+        out.stride(0), out.stride(1),
+        N=N, D=D, PACKED_D=packed_d,
+        GQA_RATIO=gqa_ratio,
+        BITS=eff_bits, VALS_PER_BYTE=vals_per_byte,
+        BLOCK_N=BLOCK_N,
+    )
+    return out
+
+
+def turboquant_qjl_score_gqa(
+    q_sketched: torch.Tensor,       # (QH, D)
+    qjl_signs: torch.Tensor,        # (KVH, N, D//8) uint8 packed signs
+    residual_norms: torch.Tensor,   # (KVH, N)
+    qjl_scale: float,
+    gqa_ratio: int,
+    out: torch.Tensor = None,
+) -> torch.Tensor:
+    """Compute QJL attention score contribution for GQA."""
+    if q_sketched.dim() == 3:
+        q_sketched = q_sketched.squeeze(1)
+
+    QH, D = q_sketched.shape
+    N = qjl_signs.shape[1]
+    packed_d_signs = qjl_signs.shape[2]
+
+    if out is None:
+        out = torch.zeros(QH, N, device=q_sketched.device, dtype=torch.float32)
+
+    BLOCK_N = min(128, triton.next_power_of_2(N))
+    grid = (QH, triton.cdiv(N, BLOCK_N))
+
+    _turboquant_qjl_score_gqa_kernel[grid](
+        q_sketched, qjl_signs, residual_norms, out,
+        q_sketched.stride(0), q_sketched.stride(1),
+        qjl_signs.stride(0), qjl_signs.stride(1), qjl_signs.stride(2),
+        residual_norms.stride(0), residual_norms.stride(1),
+        out.stride(0), out.stride(1),
+        N=N, D=D, PACKED_D_SIGNS=packed_d_signs,
+        GQA_RATIO=gqa_ratio, QJL_SCALE=qjl_scale,
+        BLOCK_N=BLOCK_N,
+    )
+    return out
+
+
+def turboquant_attention_score_gqa(
+    query: torch.Tensor,               # (QH, D), (QH, 1, D), or (1, QH, D)
+    quantized_key,                      # ProdQuantized with KVH rows
+    Pi: torch.Tensor,
+    S: torch.Tensor,
+    centroids: torch.Tensor,
+    mse_bits: int,
+    qjl_scale: float,
+    gqa_ratio: int,
+) -> torch.Tensor:
+    """High-level TurboQuant score for grouped-query attention.
+
+    Returns: (QH, N) raw logits, before attention scaling.
+    """
+    if query.dim() == 3:
+        if query.shape[1] == 1:
+            query = query.squeeze(1)
+        elif query.shape[0] == 1:
+            query = query.squeeze(0)
+        else:
+            raise ValueError("GQA Triton score expects one decode token")
+
+    QH, _ = query.shape
+    kv_heads = quantized_key.mse_indices.shape[0]
+    if QH != kv_heads * gqa_ratio:
+        raise ValueError(
+            f"Incompatible GQA shapes: QH={QH}, KVH={kv_heads}, "
+            f"gqa_ratio={gqa_ratio}"
+        )
+
+    q_rot = torch.matmul(query.float(), Pi.T)
+    q_sketch = torch.matmul(query.float(), S.T)
+
+    scores = turboquant_mse_score_gqa(
+        q_rot,
+        quantized_key.mse_indices,
+        quantized_key.norms,
+        centroids,
+        mse_bits,
+        gqa_ratio,
+    )
+    return turboquant_qjl_score_gqa(
+        q_sketch,
+        quantized_key.qjl_signs,
+        quantized_key.residual_norms,
+        qjl_scale,
+        gqa_ratio,
+        out=scores,
+    )
 
 
 def turboquant_fused_decode(

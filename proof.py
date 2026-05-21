@@ -13,6 +13,14 @@ GPU_MEM = float(os.environ.get("GPU_MEM", "0.90"))
 MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "131072"))
 GPUS = os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,4,6")
 PYTHON = sys.executable
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _with_repo_on_pythonpath(env):
+    """Let /tmp subprocess scripts import this checkout without editable install."""
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = REPO_ROOT if not existing else f"{REPO_ROOT}{os.pathsep}{existing}"
+    return env
 
 
 def run_phase(name, script):
@@ -23,6 +31,7 @@ def run_phase(name, script):
     env["CUDA_VISIBLE_DEVICES"] = GPUS
     env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     env["TOKENIZERS_PARALLELISM"] = "false"
+    _with_repo_on_pythonpath(env)
     r = subprocess.run([PYTHON, path], capture_output=True, text=True, env=env, timeout=600)
     if r.returncode != 0:
         print(f"=== {name} FAILED ===")

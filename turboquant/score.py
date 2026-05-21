@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import math
 import logging
+import os
 import torch
 import torch.nn.functional as F
+from typing import Optional
 
 from turboquant.store import FlatCache, CompressedKVStore
 from turboquant.kv_cache import dequantize_values
@@ -24,6 +26,15 @@ from turboquant.quantizer import TurboQuantProd
 logger = logging.getLogger("turboquant.score")
 
 MIN_HISTORY_FOR_TQ = 16
+
+
+def _use_triton_score(query: torch.Tensor) -> bool:
+    """Experimental fast path gate for Triton compressed-key score kernels."""
+    return (
+        query.is_cuda
+        and os.environ.get("TURBOQUANT_USE_TRITON_SCORE", "").lower()
+        in ("1", "true", "yes", "on")
+    )
 
 
 def compute_hybrid_attention(
@@ -90,6 +101,13 @@ def _attend_compressed_only(
     scale: float,
 ) -> torch.Tensor:
     """Attention over compressed history only (PyTorch path)."""
+    if _use_triton_score(query):
+        triton_out = _attend_compressed_only_triton_score(
+            query, flat, quantizer, gqa_ratio, num_kv_heads, scale
+        )
+        if triton_out is not None:
+            return triton_out
+
     k_dequant = quantizer.dequantize(flat.prod_q)  # (H_kv, N, D)
     v_dequant = dequantize_values(flat.value_q, 32)
 
@@ -123,6 +141,14 @@ def _attend_hybrid(
     scale: float,
 ) -> torch.Tensor:
     """Merge compressed history + exact recent via concatenated attention."""
+    if _use_triton_score(query):
+        triton_out = _attend_hybrid_triton_score(
+            query, flat, quantizer, recent_k, recent_v,
+            gqa_ratio, num_kv_heads, scale,
+        )
+        if triton_out is not None:
+            return triton_out
+
     k_hist = quantizer.dequantize(flat.prod_q)  # (H_kv, N_hist, D)
     v_hist = dequantize_values(flat.value_q, 32)
 
@@ -133,6 +159,125 @@ def _attend_hybrid(
     v_all = torch.cat([v_hist.float(), v_recent.float()], dim=1)
 
     return _matmul_attend(query, k_all, v_all, gqa_ratio, num_kv_heads, scale)
+
+
+def _compressed_scores_triton_gqa(
+    query: torch.Tensor,
+    flat: FlatCache,
+    quantizer: TurboQuantProd,
+    gqa_ratio: int,
+    num_kv_heads: int,
+    scale: float,
+) -> Optional[torch.Tensor]:
+    """Return scaled compressed-history logits with the Triton GQA score kernel.
+
+    Returns shape (T, Q_heads, N). Currently decode-only (T=1); callers fall
+    back to the PyTorch path for prefill or unsupported layouts.
+    """
+    if query.shape[0] != 1:
+        return None
+
+    try:
+        from turboquant.triton_kernels import turboquant_attention_score_gqa
+    except Exception as exc:
+        logger.debug("[TurboQuant] Triton score import failed; falling back: %s", exc)
+        return None
+
+    prod_q = flat.prod_q
+    if prod_q.mse_indices.dim() != 3:
+        return None
+    if prod_q.mse_indices.shape[0] != num_kv_heads:
+        return None
+
+    raw_scores = turboquant_attention_score_gqa(
+        query=query,
+        quantized_key=prod_q,
+        Pi=quantizer.mse_quantizer.Pi,
+        S=quantizer.S,
+        centroids=quantizer.mse_quantizer.centroids,
+        mse_bits=prod_q.mse_bits,
+        qjl_scale=quantizer.qjl_scale,
+        gqa_ratio=gqa_ratio,
+    )
+    return raw_scores.unsqueeze(0) * scale
+
+
+def _recent_scores(
+    query: torch.Tensor,
+    recent_k: torch.Tensor,
+    gqa_ratio: int,
+    num_kv_heads: int,
+    scale: float,
+) -> torch.Tensor:
+    """Compute scaled exact recent logits without expanding KV heads."""
+    T, Q, D = query.shape
+    q = query.float().view(T, num_kv_heads, gqa_ratio, D)
+    k = recent_k.transpose(0, 1).float()  # (H_kv, N_recent, D)
+    scores = torch.einsum("thgd,hnd->thgn", q, k) * scale
+    return scores.reshape(T, Q, recent_k.shape[0])
+
+
+def _attend_from_grouped_logits(
+    query: torch.Tensor,
+    logits: torch.Tensor,
+    values: torch.Tensor,
+    gqa_ratio: int,
+    num_kv_heads: int,
+) -> torch.Tensor:
+    """Softmax logits and apply grouped values without repeating KV tensors."""
+    T, Q, D = query.shape
+    weights = F.softmax(logits, dim=-1)
+    w = weights.view(T, num_kv_heads, gqa_ratio, logits.shape[-1])
+    out = torch.einsum("thgn,hnd->thgd", w.float(), values.float())
+    return out.reshape(T, Q, D).to(query.dtype)
+
+
+def _attend_compressed_only_triton_score(
+    query: torch.Tensor,
+    flat: FlatCache,
+    quantizer: TurboQuantProd,
+    gqa_ratio: int,
+    num_kv_heads: int,
+    scale: float,
+) -> Optional[torch.Tensor]:
+    scores = _compressed_scores_triton_gqa(
+        query, flat, quantizer, gqa_ratio, num_kv_heads, scale
+    )
+    if scores is None:
+        return None
+
+    v_dequant = dequantize_values(flat.value_q, 32)
+    return _attend_from_grouped_logits(
+        query, scores, v_dequant, gqa_ratio, num_kv_heads
+    )
+
+
+def _attend_hybrid_triton_score(
+    query: torch.Tensor,
+    flat: FlatCache,
+    quantizer: TurboQuantProd,
+    recent_k: torch.Tensor,
+    recent_v: torch.Tensor,
+    gqa_ratio: int,
+    num_kv_heads: int,
+    scale: float,
+) -> Optional[torch.Tensor]:
+    hist_scores = _compressed_scores_triton_gqa(
+        query, flat, quantizer, gqa_ratio, num_kv_heads, scale
+    )
+    if hist_scores is None:
+        return None
+
+    recent_scores = _recent_scores(query, recent_k, gqa_ratio, num_kv_heads, scale)
+    logits = torch.cat([hist_scores, recent_scores], dim=-1)
+
+    v_hist = dequantize_values(flat.value_q, 32)
+    v_recent = recent_v.transpose(0, 1)
+    values = torch.cat([v_hist.float(), v_recent.float()], dim=1)
+
+    return _attend_from_grouped_logits(
+        query, logits, values, gqa_ratio, num_kv_heads
+    )
 
 
 def _matmul_attend(
