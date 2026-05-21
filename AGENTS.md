@@ -94,6 +94,166 @@ python eval.py \
 - `--key-bits`, `--value-bits`, `--buffer-size`: TurboQuant settings.
 - `--output-format {json,text}`: structured metrics or answer-only output.
 
+## LongBench workflow
+
+Use `scripts/run_longbench.sh` as the preferred LongBench entrypoint. It wraps
+`eval_longbench.py`, runs one vLLM process per dataset/mode task, and supports
+bash-level data parallelism across GPU groups plus vLLM tensor parallelism inside
+each group. Keep generated artifacts out of git: `longbench_out/` and `reports/`
+are intentionally ignored.
+
+### Configuration and prompt-template contract
+
+- LongBench config JSON lives under `longbench_config/`:
+  - `dataset2prompt.json`
+  - `dataset2maxlen.json`
+  - `model2path.json`
+  - `model2maxlen.json`
+- LongBench formatting lives in `turboquant/longbench.py`.
+- The chat template and prompt handling must stay byte-for-byte compatible with
+  `/home/zijie/Code/LUTAttn`; do not "simplify" the template unless the LUTAttn
+  source changes too.
+- `tests/test_longbench.py` checks representative prompt branches and compares
+  copied config files against the LUTAttn copy when that repository is present.
+
+### Default full TurboQuant run
+
+The script is configured for a full TurboQuant LongBench run by default:
+
+```bash
+bash scripts/run_longbench.sh
+```
+
+Default behavior:
+
+- `MODEL=llama3.1-8b`
+- `MODEL_PATH=$HOME/models/Llama-3.1-8B-Instruct` when present; otherwise use
+  `MODEL_PATH`/`VLLM_MODEL_PATH` or the `longbench_config/model2path.json` value.
+- `EVAL_MODES_CSV=tq`
+- `GPU_IDS_CSV=0,1,2,3,4,5`
+- `TP_SIZE=2`, so the default schedule creates three disjoint TP=2 groups:
+  `0,1`, `2,3`, and `4,5`.
+- `DATASETS_CSV` unset means all 21 LongBench subsets are evaluated.
+- `MAX_SAMPLES=-1` means full dataset; set `MAX_SAMPLES=1` only for smoke tests.
+- `MAX_MODEL_LEN=32768`, `MAX_NUM_SEQS=1`, `GPU_MEMORY_UTILIZATION=0.65`.
+- `MAX_GEN` unset means use per-dataset generation lengths from
+  `longbench_config/dataset2maxlen.json`.
+- `FREE_KV_CACHE=1` frees hooked KV state after each dataset generation.
+- `SCORE_RESULTS=1` writes `result.json` after prediction files finish.
+
+Default outputs:
+
+- Predictions: `longbench_out/pred/llama3.1-8b-tq-full/*.jsonl`
+- Scores: `longbench_out/pred/llama3.1-8b-tq-full/result.json`
+- Per-task reports: `reports/longbench/full/*.json`
+- Logs: `logs/longbench/full/*.log`
+
+`longbench_out/` and `reports/` are ignored because they are local benchmark
+artifacts. `logs/` is already ignored by the general `*.log` rule.
+
+### Smoke test before full runs
+
+Use a tiny smoke run to validate scheduling, imports, template formatting, vLLM
+startup, and TurboQuant hooks before launching all subsets:
+
+```bash
+DRY_RUN=0 \
+OVERWRITE=1 \
+RUN_NAME=smoke \
+OUTPUT_TAG=smoke \
+TP_SIZE=2 \
+GPU_IDS_CSV=0,1,2,3,4,5 \
+DATASETS_CSV=trec,hotpotqa,passage_count \
+MAX_SAMPLES=1 \
+MAX_MODEL_LEN=4096 \
+MAX_GEN=4 \
+SCORE_RESULTS=0 \
+bash scripts/run_longbench.sh
+```
+
+Expected smoke outputs:
+
+- Predictions: `longbench_out/pred/llama3.1-8b-tq-smoke/{trec,hotpotqa,passage_count}.jsonl`
+- Reports: `reports/longbench/smoke/*.json`
+- Logs: `logs/longbench/smoke/*.log`
+
+Each smoke JSONL should have one line when `MAX_SAMPLES=1`, and each report JSON
+should contain `"status": "ok"`.
+
+### Multi-GPU and TP controls
+
+- Prefer `GPU_IDS_CSV` for simple contiguous scheduling. The script derives
+  groups by slicing `GPU_IDS_CSV` into chunks of `TP_SIZE`.
+  - Example: `GPU_IDS_CSV=0,1,2,3,4,5 TP_SIZE=2` creates 3 workers.
+  - Example: `GPU_IDS_CSV=0,1,2,3 TP_SIZE=4` creates 1 worker.
+- Use `GPU_GROUPS_CSV` when explicit non-contiguous groups are needed. It
+  overrides `GPU_IDS_CSV`.
+  - Example: `GPU_GROUPS_CSV='0,2;1,3' TP_SIZE=2`.
+- Groups must be disjoint and each group must contain exactly `TP_SIZE` GPUs.
+- Keep `MAX_NUM_SEQS=1` for TurboQuant LongBench until per-request TurboQuant
+  state isolation is implemented.
+
+### Resume, overwrite, and dry-run
+
+- `OVERWRITE=0` resumes by default: existing dataset JSONL files are reused and
+  only missing samples are generated.
+- Set `OVERWRITE=1` for a fresh rerun of selected datasets.
+- Set `DRY_RUN=1` to validate grouping, environment variables, and the exact
+  commands without loading models.
+
+Example dry-run:
+
+```bash
+DRY_RUN=1 \
+TP_SIZE=2 \
+GPU_IDS_CSV=0,1,2,3,4,5 \
+DATASETS_CSV=trec,hotpotqa \
+bash scripts/run_longbench.sh
+```
+
+### Single-dataset direct entrypoint
+
+Use `eval_longbench.py` directly for debugging one subset:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+TOKENIZERS_PARALLELISM=false \
+python eval_longbench.py \
+  --model-name llama3.1-8b \
+  --model-path /home/zijie/models/Llama-3.1-8B-Instruct \
+  --mode tq \
+  --dataset hotpotqa \
+  --max-samples 1 \
+  --max-model-len 4096 \
+  --max-gen 4 \
+  --tp-size 2 \
+  --gpu-memory-utilization 0.65 \
+  --max-num-seqs 1 \
+  --output-root longbench_out/pred \
+  --output-tag debug \
+  --report-json reports/longbench/debug/hotpotqa.json \
+  --free-kv-cache \
+  --overwrite
+```
+
+The direct entrypoint writes predictions to
+`longbench_out/pred/<model-name>-<mode>-<output-tag>/<dataset>.jsonl` and writes
+metadata/status to the path passed via `--report-json`.
+
+### Scoring existing predictions
+
+The launcher scores automatically when `SCORE_RESULTS=1`. To score an existing
+prediction directory manually:
+
+```bash
+python score_longbench.py \
+  --model llama3.1-8b-tq-full \
+  --output-root longbench_out/pred
+```
+
+This writes `longbench_out/pred/llama3.1-8b-tq-full/result.json`.
+
 ## 32k TP memory benchmark workflow
 
 Use this flow to measure Llama 3.1 8B 32k-context peak memory under tensor parallelism.
@@ -211,6 +371,7 @@ python eval.py \
 
 ## Current limitations
 
-- `eval.py` is a single-prompt evaluator, not a LongBench or batch dataset harness.
+- `eval.py` remains a single-prompt evaluator; use `eval_longbench.py` or
+  `scripts/run_longbench.sh` for LongBench.
 - TurboQuant integration uses vLLM monkey-patching; treat benchmark numbers as experimental unless reproduced across multiple prompts.
 - `--use-triton-score` only accelerates compressed-history QK score calculation; softmax and value aggregation are still outside that kernel path.
