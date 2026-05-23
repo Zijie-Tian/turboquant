@@ -102,6 +102,33 @@ bash-level data parallelism across GPU groups plus vLLM tensor parallelism insid
 each group. Keep generated artifacts out of git: `longbench_out/` and `reports/`
 are intentionally ignored.
 
+### KV-bit LongBench testing skill
+
+When testing LongBench with non-default TurboQuant KV bit widths—especially the
+all-4bit KV configuration (`--key-bits=4 --value-bits=4`)—use the
+`turboquant-longbench-kv4` skill before preparing or launching commands. The skill
+lives at `~/.codex/skills/turboquant-longbench-kv4/SKILL.md` and records the
+complete dry-run, smoke, full-run, scoring, resume, and validation workflow.
+
+For all-4bit KV LongBench runs, configure the launcher through
+`EXTRA_EVAL_ARGS` rather than nonexistent `KEY_BITS`/`VALUE_BITS` environment
+variables:
+
+```bash
+RUN_NAME=kv4bit \
+OUTPUT_TAG=kv4bit \
+EVAL_MODES_CSV=tq \
+OVERWRITE=1 \
+SCORE_RESULTS=1 \
+FREE_KV_CACHE=1 \
+EXTRA_EVAL_ARGS="--key-bits=4 --value-bits=4 --initial-layers-count=0" \
+bash scripts/run_longbench.sh
+```
+
+Always run the skill's dry-run command first when only configuring or validating
+the benchmark command, and use distinct `RUN_NAME`/`OUTPUT_TAG` values so KV4
+outputs never mix with default 3-bit-key/2-bit-value outputs.
+
 ### Configuration and prompt-template contract
 
 - LongBench config JSON lives under `longbench_config/`:
